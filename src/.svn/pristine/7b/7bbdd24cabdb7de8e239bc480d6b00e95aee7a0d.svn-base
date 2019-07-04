@@ -1,0 +1,148 @@
+#include "application/CAsioService.h"
+#include "common/log.h"
+
+namespace application
+{
+	CAsioService::CAsioService()
+	{
+		
+	}
+
+	CAsioService::~CAsioService()
+	{
+		for (auto iter = m_NetServers.begin(); iter != m_NetServers.end(); iter++)
+		{
+			SAFE_DELETE(iter->second);
+		}
+		m_NetServers.clear();
+
+		for (auto iter = m_NetClients.begin(); iter != m_NetClients.end(); iter++)
+		{
+			SAFE_DELETE(iter->second);
+		}
+		m_NetClients.clear();
+	}
+
+	CNetServer* CAsioService::GetNetServer(int32 nettype)
+	{
+		if (m_NetServers.find(nettype) == m_NetServers.end())
+			return NULL;
+		return m_NetServers[nettype];
+	}
+
+	CNetClient* CAsioService::GetNetClient(int32 nettype)
+	{
+		if (m_NetClients.find(nettype) == m_NetClients.end())
+			return NULL;
+		return m_NetClients[nettype];
+	}
+
+	void CAsioService::InitNetwork(int32 nettype, network::NetService::S_NCB* p_ncb)
+	{
+		if (GetNetServer(nettype) != NULL)
+		{
+			LOG_WARNING("init network with type %d but already exists, check it", nettype);
+			return;
+		}
+
+		CNetServer* pNetServer = new CNetServer(io_service_);
+		pNetServer->Init(nettype, p_ncb);
+		m_NetServers[nettype] = pNetServer;
+	}
+
+	void CAsioService::InitClient(int32 nettype, network::NetClient::S_NCB_CLI* p_ncb_cli)
+	{
+		if (GetNetClient(nettype) != NULL)
+		{
+			LOG_WARNING("init client with type %d but already exists, check it", nettype);
+			return;
+		}
+
+		CNetClient* pNetClient = new CNetClient(io_service_);
+		pNetClient->Init(nettype, p_ncb_cli);
+		m_NetClients[nettype] = pNetClient;
+	}
+
+	void CAsioService::StartNetwork(int32 nettype, const char* ip, int32 port, bool need_msg_num_checker, bool encrypt, int32 maxclients)
+	{
+		if (GetNetServer(nettype) == NULL)
+		{
+			LOG_ERROR("start network with type %d but not exists, check it", nettype);
+			return;
+		}
+		GetNetServer(nettype)->Start(ip, port, need_msg_num_checker, encrypt, maxclients);
+	}
+
+	void CAsioService::ConnectServer(int32 nettype, const char* szAddr, int32 port, bool encrypt, int32 retrytimes, int32 retrysec)
+	{
+		if (GetNetClient(nettype) == NULL)
+		{
+			LOG_ERROR("connect to server with type %d but not exists, check it", nettype);
+			return;
+		}
+		GetNetClient(nettype)->Connect(szAddr, port, encrypt, retrytimes, retrysec);
+	}
+
+	void CAsioService::UninitNetwork(int32 nettype)
+	{
+		if (nettype == -1)
+		{
+			for (auto iter = m_NetServers.begin(); iter != m_NetServers.end(); iter++)
+			{
+				iter->second->Stop();
+			}
+		}
+		else if (GetNetServer(nettype) != NULL)
+		{
+			GetNetServer(nettype)->Stop();
+		}
+	}
+
+	void CAsioService::SendToClient(int32 netType, uint32 pid, t_proto proto_type, const char* msg, size_t msglen)
+	{
+		CNetServer* pServer = GetNetServer(netType);
+		if (pServer)
+		{
+			pServer->Send(pid, proto_type, msg, msglen);
+		}
+	}
+
+	void CAsioService::SendToServer(int32 netType, t_proto proto_type, const char* msg, size_t msglen)
+	{
+		CNetClient* pClient = GetNetClient(netType);
+		if (pClient)
+		{
+			pClient->Send(proto_type, msg, msglen);
+		}
+	}
+
+	size_t CAsioService::Poll()
+	{
+		size_t cnt = 0;
+		try{
+			cnt =  io_service_.poll();
+		}
+		catch (std::exception& e){
+			LOG_ERROR("asio_service_ poll Exception: %s\n", e.what());
+			throw;
+		}
+		return cnt;
+	}
+
+	void CAsioService::HeartBeat()
+	{
+		for (auto iter = m_NetClients.begin(); iter != m_NetClients.end(); iter++)
+		{
+			iter->second->HeartBeat();
+		}
+	}
+
+	void CAsioService::CheckHeartBeat()
+	{
+		for (auto iter = m_NetServers.begin(); iter != m_NetServers.end(); iter++)
+		{
+			iter->second->CheckHeartBeat();
+		}
+
+	}
+}

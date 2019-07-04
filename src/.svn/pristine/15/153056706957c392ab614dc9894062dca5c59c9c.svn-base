@@ -1,0 +1,46 @@
+#include "application/CNetServer.h"
+#include "common/log.h"
+
+namespace application
+{
+	CNetServer::CNetServer(asio::io_service& main_service)
+	{
+		m_pNetSvr = new NetService(main_service);
+	}
+
+	CNetServer::~CNetServer()
+	{
+		SAFE_DELETE(m_pNetSvr);
+	}
+
+	bool CNetServer::Init(int32 nettype, network::NetService::S_NCB* p_ncb)
+	{
+		m_tSvr = nettype;
+		return (m_pNetSvr && m_pNetSvr->init(nettype, p_ncb->acb, p_ncb->rcb, p_ncb->dcb));
+	}
+
+	bool CNetServer::Start(const char* ip, int32 port, bool need_msg_num_checker, bool encrypt, int32 maxclients)
+	{
+		return m_pNetSvr && m_pNetSvr->start(ip, port, need_msg_num_checker, encrypt, maxclients);
+	}
+
+	bool CNetServer::Stop()
+	{
+		if (m_pNetSvr)
+		{
+			m_pNetSvr->shutdown();
+			return true;
+		}
+		return false;
+	}
+
+	bool CNetServer::Send(uint32 pid, t_proto proto_type, const char* msg, size_t msglen)
+	{
+		return m_pNetSvr->send(pid, proto_type, msg, msglen);
+	}
+
+	void CNetServer::CheckHeartBeat()
+	{
+		m_pNetSvr->CheckHeartBeat();
+	}
+}

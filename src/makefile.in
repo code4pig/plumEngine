@@ -1,0 +1,116 @@
+MACHINE = $(shell uname -m)
+ifeq ($(MACHINE), x86_64)
+MBITS = 64
+else
+MBITS = 32
+endif
+
+ifndef OUT_DIR
+OUT_DIR = ../../bin/
+endif
+ifndef OUT_DIR_LIB
+OUT_DIR_LIB = ../../libs/
+endif
+ifndef INCLUDE_DIR
+INCLUDE_DIR = ../../include/
+endif
+ifndef INCLUDE_DIR_3RD
+INCLUDE_DIR_3RD = ../../3rd/include/
+endif
+ifdef SOURCE_DIR
+SOURCE_ROOT_DIRS = $(SOURCE_DIR)
+else
+SOURCE_ROOT_DIRS = .
+endif
+SOURCE_SUB_DIRS = . ** **/**
+ifndef LIB_DIR
+LIB_DIR = ../../libs/
+endif
+ifndef LIB_DIR_3RD
+LIB_DIR_3RD = ../../3rd/libs/
+endif
+ifndef IGNORE_SOURCE
+IGNORE_SOURCE = %wsocket.c
+endif
+
+CPP_SOURCES = $(foreach root, $(SOURCE_ROOT_DIRS), $(foreach sub, $(SOURCE_SUB_DIRS), $(wildcard $(root)/$(sub)/*.cpp)))
+CC_SOURCES = $(foreach root, $(SOURCE_ROOT_DIRS), $(foreach sub, $(SOURCE_SUB_DIRS), $(wildcard $(root)/$(sub)/*.cc)))
+C_SOURCES = $(foreach root, $(SOURCE_ROOT_DIRS), $(foreach sub, $(SOURCE_SUB_DIRS), $(wildcard $(root)/$(sub)/*.c)))
+ifdef IGNORE_SOURCE
+CPP_SOURCES := $(filter-out $(IGNORE_SOURCE), $(CPP_SOURCES))
+CC_SOURCES := $(filter-out $(IGNORE_SOURCE), $(CC_SOURCES))
+C_SOURCES := $(filter-out $(IGNORE_SOURCE), $(C_SOURCES))
+endif
+OBJS = $(CPP_SOURCES:.cpp=.o) $(C_SOURCES:.c=.o) $(CC_SOURCES:.cc=.o)
+DEPENDS = $(CPP_SOURCES:.cpp=.d) $(C_SOURCES:.c=.d) $(CC_SOURCES:.cc=.d)
+
+DEFINE = $(SPECIAL_DEFINE) -D HAVE_LONG_LONG -D ASIO_STANDALONE -D USE_TCMALLOC
+INCLUDE = \
+	-I . \
+	-I $(INCLUDE_DIR) \
+	-I $(INCLUDE_DIR_3RD) \
+	-I $(INCLUDE_DIR_3RD)asio
+
+LIB = \
+	$(LIB_DIR)libapplication.a \
+	$(LIB_DIR)libnetwork.a \
+	$(LIB_DIR)libscript.a \
+	$(LIB_DIR)libcommon.a \
+	$(LIB_DIR_3RD)liblog4cplus.a \
+	-pthread -lrt -ldl -lpython2.7 -lunwind
+
+ifndef UNUSE_PROFILE
+LIB += $(LIB_DIR_3RD)libtcmalloc_and_profiler.a
+else
+LIB += $(LIB_DIR_3RD)libtcmalloc_minimal.a
+endif
+
+all: $(OUT_DIR)$(OUT)
+
+ifneq ($(MAKECMDGOALS), clean)
+-include $(DEPENDS)
+endif
+
+ifdef IS_LIB
+$(OUT_DIR_LIB)$(OUT): $(OBJS)
+	mkdir -p $(OUT_DIR_LIB)
+	ar -r $@ $(OBJS)
+else
+ifdef IS_PYD
+$(OUT_DIR)$(OUT): $(OBJS)
+	mkdir -p $(OUT_DIR)
+	gcc -fPIC -o $@ $(OBJS) -rdynamic -shared $(LIB)
+else
+$(OUT_DIR)$(OUT): $(OBJS)
+	mkdir -p $(OUT_DIR)
+	g++ -o $@ $(OBJS) $(LIB)
+endif
+endif
+
+%.o: %.cpp
+	$(DISTCC) g++ -std=c++11 -m$(MBITS) -c $< -o $@ $(INCLUDE) -ggdb $(DEFINE) -fpermissive -Wno-deprecated-declarations -Wno-write-strings
+
+%.o: %.cc
+	$(DISTCC) g++ -m$(MBITS) -c $< -o $@ $(INCLUDE) -ggdb $(DEFINE)
+
+%.o: %.c
+	$(DISTCC) gcc -m$(MBITS) -c $< -o $@ $(INCLUDE) -ggdb $(DEFINE)
+
+%.d: %.cpp
+	set -e;\
+	g++ -MM -std=c++11 $(INCLUDE) $(DEFINE) $< | sed 's,\(.*\)\.o[ :]*,$*.o $@ : ,g' > $@
+
+%.d: %.cc
+	set -e;\
+	g++ -MM $(INCLUDE) $(DEFINE) $< | sed 's,\(.*\)\.o[ :]*,$*.o $@ : ,g' > $@
+
+%.d: %.c
+	set -e;\
+	gcc -MM $(INCLUDE) $(DEFINE) $< | sed 's,\(.*\)\.o[ :]*,$*.o $@ : ,g' > $@
+
+.PHONY: clean
+clean:
+	rm -rf $(OBJS)
+	rm -rf $(DEPENDS)
+	rm -rf $(OUT_DIR)$(OUT)
+

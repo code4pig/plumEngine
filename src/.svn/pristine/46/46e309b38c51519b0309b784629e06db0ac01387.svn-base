@@ -1,0 +1,29 @@
+#include "network/CServerConnection.h"
+#include "common/log.h"
+
+namespace network
+{
+	CServerConnection::CServerConnection(BaseNetService& net, bool encrypt) :AsioConnection(net, encrypt)
+	{
+
+	}
+
+	CServerConnection::~CServerConnection()
+	{
+
+	}
+
+	bool CServerConnection::init_peer_ip()
+	{
+		asio::error_code ec;
+		asio::ip::tcp::endpoint endpoint = socket_.remote_endpoint(ec);
+		if (ec)
+		{
+			LOG_ERROR("get_peer_ip failed err %d, shutdown %d, errmsg %s", ec.value(), get_pid(), ec.message().c_str());
+			return false;
+		}
+		ip_ = endpoint.address().to_string();
+		return true;
+	}
+
+}

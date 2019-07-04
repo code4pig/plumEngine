@@ -1,0 +1,541 @@
+#ifdef _WIN32
+#include "direct.h"
+#else
+#include "unistd.h"
+#endif
+#include "common/common.h"
+#include "common/log.h"
+#include "application/CApplication.h"
+#include "common/CNewTimeSystem.h"
+#include "asio/asio.hpp"
+#include "script/CScripting.h"
+#include "script/ScriptUtils.h"
+#include "application/pygame.h"
+#include "gperftools/malloc_extension.h"
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+#include "common/CTime.h"
+#ifdef __cplusplus
+}
+#endif
+
+#define WORK_DIR "../data"
+#define DEF_LOG_DIR "../log"
+
+#define SCRIPT_MOD_GS "script.%s.object_factory"
+#define SCRIPT_MOD_GS_CREATE "CreateApp"
+//主application核心事件回调
+#define SCRIPT_FUNC_GS_STARTUP "OnStartUp"
+#define SCRIPT_FUNC_GS_UPDATE "OnUpdate"
+#define SCRIPT_FUNC_GS_SHUTDOWN "OnShutDown"
+//作为服务器收到客户端网络事件的回调
+#define SCRIPT_FUNC_GS_CONNECT "OnClientConnected"
+#define SCRIPT_FUNC_GS_RECV "OnClientRpcMsg"
+#define SCRIPT_FUNC_GS_DISCONN "OnClientDisconnect"
+//作为客户端收到服务端网络事件的回调
+#define SCRIPT_FUNC_CLI_CONNECT "OnConnectToServer"
+#define SCRIPT_FUNC_CLI_CONN_FAIL "OnConnectToServerFailed"
+#define SCRIPT_FUNC_CLI_RECV "OnServerRpcMsg"
+#define SCRIPT_FUNC_CLI_DISCONN "OnServerDisconnect"
+
+namespace application
+{
+
+	CApplication::CApplication()
+	{
+		m_uFrameRate = 60;
+		m_uFrameTimeInMS = 1000 / m_uFrameRate;
+		m_pTimeSys = NULL;
+		m_bQuit = false;
+
+		m_bIncomingSignal = false;
+		m_nSignal = 0;
+
+		m_pAsioService = new CAsioService();
+		m_pyObject = NULL;
+		memset(m_szOldDir, 0, sizeof(m_szOldDir));
+		m_pNcb = new network::NetService::S_NCB;
+		m_pNcb_Cli = new network::NetClient::S_NCB_CLI;
+		Inst() = this;
+	}
+
+	CApplication::~CApplication()
+	{
+		SAFE_DELETE(m_pNcb);
+		SAFE_DELETE(m_pNcb_Cli);
+		SAFE_DELETE(m_pAsioService);
+	}
+
+	CApplication* CApplication::GetInstance()
+	{
+		return Inst();
+	}
+
+	CApplication*& CApplication::Inst()
+	{
+		static CApplication* g_pApp = NULL;
+		return g_pApp;
+	}
+
+	CNewTimeSystem* CApplication::GetTimeSystem()
+	{
+		return m_pTimeSys;
+	}
+
+	CAsioService* CApplication::GetAsioService()
+	{
+		return m_pAsioService;
+	}
+
+	PyObject* CApplication::GetPyObject()
+	{
+		return m_pyObject;
+	}
+
+	void CApplication::InitNetwork()
+	{
+		LOG_INFO_NOFMT("init network");
+		//网络初始化在这里
+		InitNcb();
+		InitNcbClient();
+		LOG_INFO_NOFMT("init network ok");
+	}
+
+	void CApplication::StartNetwork(int32 nettype, const char* ip, int32 port, bool encrypt, int32 maxclients)
+	{
+		m_pAsioService->InitNetwork(nettype, m_pNcb);
+		m_pAsioService->StartNetwork(nettype, ip, port, encrypt, maxclients);
+	}
+
+	void CApplication::ConnectToServer(int32 nettype, const char* szAddr, int32 port, bool encrypt, int32 retrytimes, int32 retrysec)
+	{
+		m_pAsioService->InitClient(nettype, m_pNcb_Cli);
+		m_pAsioService->ConnectServer(nettype, szAddr, port, encrypt, retrytimes, retrysec);
+	}
+
+	void CApplication::StartScript()
+	{
+		char tmpMod[512] = { 0 };
+		snprintf(tmpMod, sizeof(tmpMod)-1, SCRIPT_MOD_GS, m_strAppName.c_str());
+		script::CObject appObj = script::CallModuleFunction(tmpMod, SCRIPT_MOD_GS_CREATE);
+		m_pyObject = appObj.GetPyObj();
+		//LOG_INFO("app ref count is %d", m_pyObject->ob_refcnt);
+		Py_XINCREF(m_pyObject);
+		//LOG_INFO("app ref count is %d", m_pyObject->ob_refcnt);
+		// 要求脚本类对象的初始化
+		script::CallObjectMethod(m_pyObject, SCRIPT_FUNC_GS_STARTUP, "s", m_strConfig.c_str());
+	}
+
+	void CApplication::InitScript(const char* szModuleName)
+	{
+		LOG_INFO_NOFMT("Init app");
+		//脚本初始化在这里
+		script::CScripting::Init(MY_PYTHON_HOME);
+		application::PyGame_Init();
+		script::CScripting::Import("script.common.initscript");
+		script::CScripting::ImportDir("script/common", "script.common", szModuleName);
+		std::ostringstream tmpDir;
+		tmpDir << "script/" << szModuleName;
+		std::ostringstream tmpMod;
+		tmpMod << "script." << szModuleName;
+		script::CScripting::ImportDir(tmpDir.str().c_str(), tmpMod.str().c_str(), szModuleName);
+		LOG_INFO_NOFMT("script init ok");
+	}
+
+	void CApplication::InitLogger(const char* szLog)
+	{
+		const char* realLogDir = szLog ? szLog : DEF_LOG_DIR;
+		::InitLogger(realLogDir, m_strAppName.c_str());
+		LOG_INFO_NOFMT("application started");
+		LOG_INFO("cur working dir is %s, now change to %s", m_szOldDir, WORK_DIR);
+		LOG_INFO("custom log dir is %s and real log dir %s", szLog, realLogDir);
+	}
+
+	void CApplication::InitDir(const char* szNewDir)
+	{
+#ifdef _WIN32
+		_getcwd(m_szOldDir, sizeof(m_szOldDir) - 1);
+		_chdir(szNewDir);
+#else
+		getcwd(m_szOldDir, sizeof(m_szOldDir) -1);
+		chdir(szNewDir);
+#endif
+	}
+
+	void CApplication::InitTimeSystem()
+	{
+		m_uFrameTimeInMS = 1000 / m_uFrameRate;
+		m_pTimeSys = new common::CNewTimeSystem(m_uFrameTimeInMS);
+		m_pTimeSys->Reset();
+	}
+
+	void CApplication::UnInitTimeSystem()
+	{
+		m_pTimeSys->Reset();
+		SAFE_DELETE(m_pTimeSys);
+	}
+
+	void CApplication::InitFrameRate(uint8 framerate)
+	{
+		if (m_pTimeSys == NULL)
+		{
+			m_uFrameRate = framerate;
+			InitTimeSystem();
+			SetTickMgr(m_pTimeSys->GetTickMgr());
+			LOG_INFO("frame rate is set to %d", m_uFrameRate);
+		}
+		else
+		{
+			LOG_ERROR("%s", "InitFrameRate bug timesystem already exists, ignore this init");
+		}
+	}
+
+	void CApplication::Init(const char* appName, const char* szConf, const char* szLog)
+	{
+		//appName要跟脚本目录名对应，如gameserver，则对应加载script/gameserver
+		m_strAppName = appName;
+		m_strConfig = szConf;
+		InitSignalHandler();
+		InitDir(WORK_DIR);
+		InitLogger(szLog);
+		InitScript(appName);
+		InitNetwork();
+	}
+
+	void CApplication::UnInit()
+	{
+		LOG_INFO_NOFMT("break from main loop, call script shutdown");
+		//清理操作
+		UnInitScript();
+		UnInitNetwork();
+		UnInitLogger();
+		UnInitTimeSystem();
+	}
+
+	void CApplication::UnInitNetwork()
+	{
+		m_pAsioService->UninitNetwork();
+	}
+
+	void CApplication::UnInitScript()
+	{
+		script::CallObjectMethod(m_pyObject, SCRIPT_FUNC_GS_SHUTDOWN, "");
+		if (m_pyObject->ob_refcnt > 2)
+			LOG_ERROR("Shell | GlobalLogicService's python object not release! refcount is %d", m_pyObject->ob_refcnt);
+		Py_XDECREF(m_pyObject);
+		m_pyObject = NULL;
+	}
+
+	void CApplication::UnInitLogger()
+	{
+		::UninitLogger();
+	}
+
+	void CApplication::GenMemStat()
+	{
+#ifdef USE_TCMALLOC
+		char buffer[1024*1024] = {0};
+		MallocExtension::instance()->GetStats(buffer, sizeof(buffer));
+		LOG_INFO("tcmalloc stat %s", buffer);
+#endif
+	}
+
+	void CApplication::OnUpdate()
+	{
+		script::CallObjectMethod(m_pyObject, SCRIPT_FUNC_GS_UPDATE);
+	}
+
+	void CApplication::OpenHeartBeat(int32 sendTick, int32 checkTick)
+	{
+		if (sendTick == 0 || checkTick == 0)
+		{
+			LOG_WARNING("OpenHeartBeat wrong with sendTick %d checkTick %d", sendTick, checkTick);
+			return;
+		}
+		RegTick(&application::CApplication::OnHeartBeatTick, sendTick, "sendtick");
+		RegTick(&application::CApplication::OnCheckHeartBeatTick, checkTick, "checktick");
+	}
+
+	void CApplication::OnLogicStart()
+	{
+		LOG_INFO_NOFMT("on logic start");
+		StartScript();
+	}
+
+	void CApplication::OnHeartBeatTick()
+	{
+		m_pAsioService->HeartBeat();
+	}
+
+	void CApplication::OnCheckHeartBeatTick()
+	{
+		m_pAsioService->CheckHeartBeat();
+	}
+
+	void CApplication::OnFrameIdle(int32 uRestTime)
+	{
+
+	}
+
+	int32 CApplication::Run()
+	{
+		LOG_INFO_NOFMT("enter main loop");
+		try
+		{
+			OnLogicStart();
+			uint64 uBeginTime = GetTimeTickInMS();
+			uint64 uEndTime = 0;
+			uint32 uDelta = 0, uFrameTime = 0;
+			//GenMemStat();
+			while (!m_bQuit)
+			{
+				UpdateFastTime();
+
+				uint64 uNowTime = GetFastTimeTickInMs();
+
+				uDelta = (uint32)(uNowTime - uBeginTime);
+				uBeginTime = uNowTime;
+
+				if (m_bIncomingSignal)
+				{
+					LOG_INFO("-- got kill signal %d, shutdown --", m_nSignal);
+					DispatchSignal(m_nSignal);
+					m_bIncomingSignal = false;
+				}
+				int32 pushCnt = m_pTimeSys->PushLogicTime(uNowTime);
+				for (int32 i = 0; i < pushCnt; i++)
+				{
+					//脚本tick追帧
+					OnUpdate();
+				}
+				if (m_pAsioService->Poll() == 0)
+				{
+					//todo
+				}
+				/*
+				//如果有空闲时间，还想让脚本决定是否要做些额外的事情，如gc
+				int32 uRestTime = int32(m_uFrameTimeInMS + uBeginTime - GetTimeTickInMS());
+				if (uRestTime > 0)
+				{
+					OnFrameIdle(uRestTime);
+				}
+				*/
+				uEndTime = GetTimeTickInMS();
+				if (uEndTime < uBeginTime)
+				{
+					//多核时间倒置，报警提示下
+					LOG_WARNING("frame got unmatch time %d ms %d ms", uBeginTime, uEndTime);
+					continue;
+				}
+				uFrameTime = (uint32)(uEndTime - uBeginTime);
+
+				if (m_uFrameTimeInMS > uFrameTime)
+				{
+					Sleep(m_uFrameTimeInMS - uFrameTime);
+				}
+				if (uFrameTime > 300)
+				{
+					//帧耗时过长，报警提示下
+					LOG_WARNING("frame cost too much time %d ms", uFrameTime);
+				}
+			}
+		}
+		catch (std::exception &e)
+		{
+			OnException(e);
+			return 1;
+		}
+		catch (...)
+		{
+			OnException();
+			return 1;
+		}
+
+		return 0;
+	}
+
+	void CApplication::Sleep(uint32 ms)
+	{
+		//LOG_INFO("sleep %d ms", ms);
+		std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+	}
+
+	void CApplication::Quit()
+	{
+        LOG_INFO_NOFMT("now call application's quit");
+		m_bQuit = true;
+	}
+
+	void CApplication::GenErr(const char* szErr)
+	{
+		LOG_ERROR("fatal err %s", szErr);
+		abort();
+	}
+
+	void CApplication::InitSignalHandler()
+	{
+#ifndef _WIN32
+		::signal(SIGPIPE, SIG_IGN);
+		m_sigaction.sa_handler = SignalHandler;
+		sigfillset(&m_sigaction.sa_mask);
+		m_sigaction.sa_flags = 0;
+
+		if(-1==sigaction(SIGHUP,&m_sigaction,NULL))
+			GenErrnoErr();
+		if(-1==sigaction(SIGINT,&m_sigaction,NULL))
+			GenErrnoErr();
+		if(-1==sigaction(SIGPIPE,&m_sigaction,NULL))
+			GenErrnoErr();
+		if(-1==sigaction(SIGALRM,&m_sigaction,NULL))
+			GenErrnoErr();		
+		if(-1==sigaction(SIGTERM,&m_sigaction,NULL))
+			GenErrnoErr();	
+		if(-1==sigaction(SIGUSR1,&m_sigaction,NULL))
+			GenErrnoErr();
+		if(-1==sigaction(SIGUSR2,&m_sigaction,NULL))
+			GenErrnoErr();
+		if(-1==sigaction(SIGTSTP,&m_sigaction,NULL))
+			GenErrnoErr();
+		if(-1==sigaction(SIGTTIN,&m_sigaction,NULL))
+			GenErrnoErr();
+		if(-1==sigaction(SIGTTOU,&m_sigaction,NULL))
+			GenErrnoErr();
+		if(-1==sigaction(SIGPOLL,&m_sigaction,NULL))
+			GenErrnoErr();
+		//if(-1==sigaction(SIGPROF,&m_sigaction,NULL))
+		//	GenErrnoErr();
+		if(-1==sigaction(SIGVTALRM, &m_sigaction, NULL))
+			GenErrnoErr();
+#else
+		if (!SetConsoleCtrlHandler(SignalHandler, TRUE))
+			GenErr("system call SetConsoleCtrlHandler failed.");
+#endif
+	}
+
+	void CApplication::OnCatchSignal(int nSignal)
+	{
+#ifdef _WIN32
+		switch (nSignal)
+		{
+		case CTRL_C_EVENT:
+		case CTRL_BREAK_EVENT:
+			nSignal = SIGINT;
+			break;
+		case CTRL_CLOSE_EVENT:
+		case CTRL_LOGOFF_EVENT:
+		case CTRL_SHUTDOWN_EVENT:
+			nSignal = SIGTERM;
+			break;
+		}
+#endif
+
+		m_bIncomingSignal = true;
+		m_nSignal = nSignal;
+		LOG_INFO("OnCatchSignal %d", m_nSignal);
+	}
+
+	void CApplication::DispatchSignal(int nSignal)
+	{
+		GenMemStat();
+		Quit();
+	}
+
+#ifndef _WIN32
+	void CApplication::SignalHandler(int nSignal)
+	{
+		if (SIGHUP == nSignal ||
+			SIGPIPE == nSignal)
+		{
+			return;
+		}
+
+		GetInstance()->OnCatchSignal(nSignal);
+	}
+
+#else
+	BOOL WINAPI CApplication::SignalHandler(DWORD dwCtrlType)
+	{
+		GetInstance()->OnCatchSignal((int)dwCtrlType);
+		return TRUE;
+	}
+
+#endif
+
+	void CApplication::OnException(std::exception &exp)
+	{
+		LOG_ERROR("Exception|%s", exp.what());
+	}
+
+	void CApplication::OnException()
+	{
+		std::cout << "caught unknown exception." << std::endl;
+		LOG_ERROR("%s", "Exception|caught unknown exception.");
+	}
+
+#ifndef _WIN32
+	void CApplication::GenErrnoErr()
+	{
+		GenErr(strerror(errno));
+	}
+#endif
+
+	void connect_cb(NetService* ns, uint32 pid, std::string ip)
+	{
+		LOG_INFO("server type %d connect_cb %d:%s\n", ns->get_service_type(), pid, ip.c_str());
+		script::CallObjectMethod(CApplication::GetInstance()->GetPyObject(), SCRIPT_FUNC_GS_CONNECT, "iIs", ns->get_service_type(), pid, ip.c_str());
+	}
+
+	void recv_cb(NetService* ns, uint32 pid, t_proto proto_type, std::shared_ptr<std::string> msg)
+	{
+		//LOG_INFO("server type %d recv_cb %d: proto %d \n", ns->get_service_type(), pid, proto_type);
+		script::CallObjectMethod(CApplication::GetInstance()->GetPyObject(), SCRIPT_FUNC_GS_RECV, "iIBs#", ns->get_service_type(), pid, proto_type, msg->c_str(), msg->size());
+	}
+
+	void disconnect_cb(NetService* ns, uint32 pid)
+	{
+		LOG_INFO("server type %d disconnect_cb %d\n", ns->get_service_type(), pid);
+		script::CallObjectMethod(CApplication::GetInstance()->GetPyObject(), SCRIPT_FUNC_GS_DISCONN, "iI", ns->get_service_type(), pid);
+	}
+
+	void CApplication::InitNcb()
+	{
+		m_pNcb->acb = connect_cb;
+		m_pNcb->rcb = recv_cb;
+		m_pNcb->dcb = disconnect_cb;
+	}
+
+	void connect_cb_cli(NetClient* nc, AsioConnection& conn)
+	{
+		LOG_INFO("client type %d connect to server cb %d:%s\n", nc->get_client_type(), conn.get_pid(), conn.get_peer_ip().c_str());
+		script::CallObjectMethod(CApplication::GetInstance()->GetPyObject(), SCRIPT_FUNC_CLI_CONNECT, "iIs", nc->get_client_type(), conn.get_pid(), conn.get_peer_ip().c_str());
+	}
+
+	void connect_fail_cb_cli(NetClient* nc, std::string msg)
+	{
+		LOG_INFO("client type %d connect_fail_cb %s\n", nc->get_client_type(), msg.c_str());
+		script::CallObjectMethod(CApplication::GetInstance()->GetPyObject(), SCRIPT_FUNC_CLI_CONN_FAIL, "is", nc->get_client_type(), msg.c_str());
+	}
+
+	void recv_cb_cli(NetClient* nc, uint32 pid, t_proto proto_type, std::shared_ptr<std::string> msg)
+	{
+		//LOG_INFO("client type %d recv_cb %d: proto %d %s\n", nc->get_client_type(), pid, proto_type, msg->c_str());
+		script::CallObjectMethod(CApplication::GetInstance()->GetPyObject(), SCRIPT_FUNC_CLI_RECV, "iIBs#", nc->get_client_type(), pid, proto_type, msg->c_str(), msg->size());
+	}
+
+	void disconnect_cb_cli(NetClient* nc)
+	{
+		LOG_INFO("client type %d disconnect_cb \n", nc->get_client_type());
+		script::CallObjectMethod(CApplication::GetInstance()->GetPyObject(), SCRIPT_FUNC_CLI_DISCONN, "i", nc->get_client_type());
+	}
+
+	void CApplication::InitNcbClient()
+	{
+		m_pNcb_Cli->ccb = connect_cb_cli;
+		m_pNcb_Cli->cfcb = connect_fail_cb_cli;
+		m_pNcb_Cli->rcb = recv_cb_cli;
+		m_pNcb_Cli->dcb = disconnect_cb_cli;
+	}
+
+}
